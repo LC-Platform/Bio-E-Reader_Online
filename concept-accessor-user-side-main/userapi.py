@@ -749,33 +749,60 @@ async def get_translated_section_summary(chapter_id: str, section_id: str, targe
 @app.get("/translate/definition/")
 async def get_translated_definition(chapter_id: str, domain_id: str, target_language: str):
     """
-    Retrieve translated definition from MongoDB.
-    Fetches the definition translation from the domain_words collection's translations object.
+    Retrieve translated definition from domain_words.translations.
+    For Gondi, if missing, translate English -> Telugu -> Gondi once
+    (same translate_to_gondi + split_text logic as translate_sentence),
+    save it into translations.gon, and return it.
     """
     doc = await domain_words_col.find_one({"chapter_id": chapter_id, "domain_id": domain_id})
-    
+
     if not doc:
         raise HTTPException(status_code=404, detail="Domain term not found")
-    
-    # Get translations object
+
     translations = doc.get("translations", {})
-    
-    # Get the translated definition for the target language
     translated_definition = translations.get(target_language)
-    
+
+    # Gondi: generate on first request, then it is cached like other languages
+    if not translated_definition and target_language.lower() in ["gon", "gondi"]:
+        english_definition = (doc.get("definition") or "").strip()
+        if not english_definition:
+            raise HTTPException(status_code=404, detail="No English definition to translate")
+
+        parts = []
+        try:
+            for chunk in split_text(" ".join(english_definition.split())):
+                chunk = chunk.strip()
+                if not chunk:
+                    continue
+                result = await translate_to_gondi(chunk)
+                parts.append(result["gondi_text"])
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f"Gondi translation failed: {exc}")
+
+        translated_definition = " ".join(parts)
+
+        if not translated_definition.strip():
+            raise HTTPException(status_code=502, detail="Gondi translation returned empty output")
+
+        # Always store under "gon" so the cache lookup above finds it next time
+        await domain_words_col.update_one(
+            {"chapter_id": chapter_id, "domain_id": domain_id},
+            {"$set": {"translations.gon": translated_definition}},
+        )
+
     if not translated_definition:
         raise HTTPException(
-            status_code=404, 
+            status_code=404,
             detail=f"Translated definition not found for language: {target_language}"
         )
-    
+
     return {
         "chapter_id": chapter_id,
         "domain_id": domain_id,
         "language": target_language,
         "translated_definition": translated_definition
     }
-
+     
 @app.get("/translate/section/")
 async def get_translated_section(chapter_id: str, section_id: str, target_language: str):
     """
